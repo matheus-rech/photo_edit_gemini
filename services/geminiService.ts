@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, Modality, Type } from "@google/genai";
 
 // Helper function to convert a File object to a Gemini API Part
 const fileToPart = async (file: File): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
@@ -274,23 +274,15 @@ export const generateImageFromText = async (
     });
     console.log('Received response from model for image generation.', response);
 
-    if (response.promptFeedback?.blockReason) {
-        const { blockReason, blockReasonMessage } = response.promptFeedback;
-        const errorMessage = `Request was blocked. Reason: ${blockReason}. ${blockReasonMessage || ''}`;
-        throw new Error(errorMessage);
-    }
-
+    // FIX: The `GenerateImagesResponse` type does not have `promptFeedback` and
+    // the `GeneratedImage` type does not have `finishReason`. The error handling
+    // logic is simplified to check for the presence of image data. API errors
+    // like blocked prompts are expected to throw exceptions.
     const generatedImage = response.generatedImages?.[0];
 
     if (generatedImage?.image?.imageBytes) {
         const base64ImageBytes: string = generatedImage.image.imageBytes;
         return `data:image/jpeg;base64,${base64ImageBytes}`;
-    }
-
-    const finishReason = generatedImage?.finishReason;
-    if (finishReason && finishReason !== 'SUCCESS') {
-        const errorMessage = `Image generation stopped unexpectedly. Reason: ${finishReason}. This can happen due to safety settings.`;
-        throw new Error(errorMessage);
     }
     
     throw new Error(`The AI model did not return an image. This could be due to safety filters or a complex prompt. Please try again.`);
@@ -335,4 +327,108 @@ Output: Return ONLY the final generated image. Do not return text.`;
     console.log('Received response from model for text-and-image generation.', response);
 
     return handleApiResponse(response, 'text-and-image-generation');
+};
+
+export interface AnalysisResult {
+    feedback: string;
+    promptForEdit: string;
+}
+
+/**
+ * Analyzes an image with a user query to get feedback and a suggested edit prompt.
+ * @param image The image file to analyze.
+ * @param userQuery The user's question about the image.
+ * @returns A promise that resolves to an object containing feedback and an edit prompt.
+ */
+export const analyzeImage = async (
+    image: File,
+    userQuery: string,
+): Promise<AnalysisResult> => {
+    console.log(`Starting image analysis for query: ${userQuery}`);
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    
+    const imagePart = await fileToPart(image);
+    
+    const systemInstruction = `You are an expert photo critic AI. Your task is to analyze the provided image based on the user's goal and provide two outputs in a structured JSON format:
+1.  'userFeedback': Constructive, helpful feedback for the user written in a friendly and encouraging tone.
+2.  'editPrompt': A detailed, technical prompt for an image generation AI (like Gemini 2.5 Flash Image) to apply the suggested improvements. This prompt must be self-contained and describe the exact edits needed to make the image better, focusing on photorealism and subtlety. It should describe edits to the original image, not create a new one.
+
+User's Goal: "${userQuery}"
+
+Analyze the image systematically. Consider composition, lighting, color, subject, focus, and overall impact in relation to the user's goal. If the image is already excellent, say so. If there are minor issues, identify them and suggest specific, actionable improvements. The 'editPrompt' should be precise enough for another AI to execute it perfectly, maintaining the original's essence (e.g., "Slightly rotate the horizon line by 1.5 degrees clockwise to make it level", "Subtly reduce the saturation of the bright red car in the background by 15% to make it less distracting", "Gently straighten the subject's tie so it hangs perfectly centered"). If no edit is necessary, 'editPrompt' should be an empty string.`;
+    
+    const response = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: { parts: [imagePart, { text: 'Analyze this image.' }] },
+        config: {
+            systemInstruction,
+            thinkingConfig: { thinkingBudget: 32768 },
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                    userFeedback: {
+                        type: Type.STRING,
+                        description: 'Helpful feedback for the user.',
+                    },
+                    editPrompt: {
+                        type: Type.STRING,
+                        description: 'A detailed, technical prompt for an image generation AI to apply the suggested edits. This can be an empty string if no edits are suggested.',
+                    },
+                },
+                required: ["userFeedback", "editPrompt"],
+            },
+        },
+    });
+
+    console.log('Received analysis response from model.', response);
+
+    try {
+        const jsonText = response.text.trim();
+        const parsed = JSON.parse(jsonText);
+        if (typeof parsed.userFeedback === 'string' && typeof parsed.editPrompt === 'string') {
+            return {
+                feedback: parsed.userFeedback,
+                promptForEdit: parsed.editPrompt,
+            };
+        } else {
+            throw new Error('Invalid JSON structure in analysis response.');
+        }
+    } catch (e) {
+        console.error("Failed to parse JSON response from analysis model", e);
+        throw new Error("The AI returned an invalid analysis format. Please try again.");
+    }
+};
+
+/**
+ * Applies an edit to an image based on a technical prompt from the analysis model.
+ * @param originalImage The original image file.
+ * @param editPrompt The technical prompt describing the desired edit.
+ * @returns A promise that resolves to the data URL of the edited image.
+ */
+export const applyAnalysisPrompt = async (
+    originalImage: File,
+    editPrompt: string,
+): Promise<string> => {
+    console.log(`Applying analysis prompt: ${editPrompt}`);
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    
+    const originalImagePart = await fileToPart(originalImage);
+    const prompt = `You are an expert photo editor AI. Your task is to perform a natural, photorealistic edit on the provided image based on the following technical instructions. The edit must be subtle and blend seamlessly. The rest of the image must remain identical to the original.
+Instructions: "${editPrompt}"
+
+Output: Return ONLY the final edited image. Do not return text.`;
+    const textPart = { text: prompt };
+
+    console.log('Sending image and analysis prompt to the model...');
+    const response: GenerateContentResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: { parts: [originalImagePart, textPart] },
+        config: {
+            responseModalities: [Modality.IMAGE],
+        }
+    });
+    console.log('Received response from model for analysis application.', response);
+    
+    return handleApiResponse(response, 'apply-analysis');
 };

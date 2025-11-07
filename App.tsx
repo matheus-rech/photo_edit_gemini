@@ -6,7 +6,7 @@
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import ReactCrop, { type Crop, type PixelCrop } from 'react-image-crop';
-import { generateEditedImage, generateFilteredImage, generateAdjustedImage, generateAutoEnhancedImage, generateImageFromText, generateUpscaledImage, generateImageFromTextAndImages } from './services/geminiService';
+import { generateEditedImage, generateFilteredImage, generateAdjustedImage, generateAutoEnhancedImage, generateImageFromText, generateUpscaledImage, generateImageFromTextAndImages, analyzeImage, applyAnalysisPrompt } from './services/geminiService';
 import Header from './components/Header';
 import Spinner from './components/Spinner';
 import FilterPanel from './components/FilterPanel';
@@ -14,9 +14,10 @@ import AdjustmentPanel from './components/AdjustmentPanel';
 import CropPanel from './components/CropPanel';
 import TextPanel from './components/TextPanel';
 import LayerPanel from './components/LayerPanel';
-import { UndoIcon, RedoIcon, EyeIcon, MagicWandIcon, UpscaleIcon, TextIcon, LayersIcon } from './components/icons';
+import { UndoIcon, RedoIcon, EyeIcon, MagicWandIcon, UpscaleIcon, TextIcon, LayersIcon, DocumentMagnifyingGlassIcon } from './components/icons';
 import StartScreen from './components/StartScreen';
 import GenerateScreen from './components/GenerateScreen';
+import AnalyzePanel from './components/AnalyzePanel';
 
 // Helper to convert a data URL string to a File object
 const dataURLtoFile = (dataurl: string, filename: string): File => {
@@ -36,7 +37,7 @@ const dataURLtoFile = (dataurl: string, filename: string): File => {
 }
 
 type AppMode = 'start' | 'generate' | 'edit';
-type Tab = 'retouch' | 'adjust' | 'filters' | 'crop' | 'text' | 'layers';
+type Tab = 'retouch' | 'adjust' | 'filters' | 'crop' | 'text' | 'layers' | 'analyze';
 
 export interface TextLayer {
   id: string;
@@ -83,6 +84,9 @@ const App: React.FC = () => {
   const [showMagnifier, setShowMagnifier] = useState(false);
   const [magnifierImageOffset, setMagnifierImageOffset] = useState({ x: 0, y: 0 });
 
+  const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+  const [analysisPromptForEdit, setAnalysisPromptForEdit] = useState<string | null>(null);
+
   // Effect to create and revoke object URLs safely for the current image
   useEffect(() => {
     if (currentImage) {
@@ -108,6 +112,11 @@ const App: React.FC = () => {
 
   const canUndo = historyIndex > 0;
   const canRedo = historyIndex < history.length - 1;
+  
+  const handleClearAnalysis = useCallback(() => {
+      setAnalysisResult(null);
+      setAnalysisPromptForEdit(null);
+  }, []);
 
   const addImageToHistory = useCallback((newImageFile: File) => {
     const newHistory = history.slice(0, historyIndex + 1);
@@ -119,7 +128,8 @@ const App: React.FC = () => {
     setCompletedCrop(undefined);
     setLayers([]);
     setSelectedLayerId(null);
-  }, [history, historyIndex]);
+    handleClearAnalysis();
+  }, [history, historyIndex, handleClearAnalysis]);
   
   const startNewHistoryWithFile = useCallback((file: File) => {
     setError(null);
@@ -133,7 +143,8 @@ const App: React.FC = () => {
     setMode('edit');
     setLayers([]);
     setSelectedLayerId(null);
-  }, []);
+    handleClearAnalysis();
+  }, [handleClearAnalysis]);
 
   const handleImageUpload = useCallback((file: File) => {
     startNewHistoryWithFile(file);
@@ -342,8 +353,9 @@ const App: React.FC = () => {
       setDisplayHotspot(null);
       setLayers([]);
       setSelectedLayerId(null);
+      handleClearAnalysis();
     }
-  }, [canUndo, historyIndex]);
+  }, [canUndo, historyIndex, handleClearAnalysis]);
   
   const handleRedo = useCallback(() => {
     if (canRedo) {
@@ -352,8 +364,9 @@ const App: React.FC = () => {
       setDisplayHotspot(null);
       setLayers([]);
       setSelectedLayerId(null);
+      handleClearAnalysis();
     }
-  }, [canRedo, historyIndex]);
+  }, [canRedo, historyIndex, handleClearAnalysis]);
 
   const handleReset = useCallback(() => {
     if (history.length > 0) {
@@ -363,8 +376,9 @@ const App: React.FC = () => {
       setDisplayHotspot(null);
       setLayers([]);
       setSelectedLayerId(null);
+      handleClearAnalysis();
     }
-  }, [history]);
+  }, [history, handleClearAnalysis]);
 
   const handleUploadNew = useCallback(() => {
       setHistory([]);
@@ -374,10 +388,18 @@ const App: React.FC = () => {
       setEditHotspot(null);
       setDisplayHotspot(null);
       setMode('start');
-  }, []);
+      handleClearAnalysis();
+  }, [handleClearAnalysis]);
 
   const handleDownload = useCallback(() => {
+    if (!currentImageUrl || !imgRef.current) return;
+
+    const image = imgRef.current;
+    const scaleX = image.naturalWidth / image.width;
+    const scaleY = image.naturalHeight / image.height;
+    
     const imageToDownload = new Image();
+    imageToDownload.crossOrigin = 'anonymous';
     imageToDownload.onload = () => {
         const canvas = document.createElement('canvas');
         canvas.width = imageToDownload.naturalWidth;
@@ -391,10 +413,12 @@ const App: React.FC = () => {
         [...layers].reverse().forEach(layer => {
             if (layer.visible && layer.type === 'text') {
                 ctx.globalAlpha = layer.opacity;
-                ctx.font = `${layer.size}px ${layer.font}`;
+                const avgScale = (scaleX + scaleY) / 2;
+                const scaledSize = layer.size * avgScale;
+                ctx.font = `${scaledSize}px ${layer.font}`;
                 ctx.fillStyle = layer.color;
                 ctx.textBaseline = 'top';
-                ctx.fillText(layer.content, layer.position.x, layer.position.y);
+                ctx.fillText(layer.content, layer.position.x * scaleX, layer.position.y * scaleY);
             }
         });
 
@@ -406,8 +430,8 @@ const App: React.FC = () => {
         link.click();
         document.body.removeChild(link);
     };
-    imageToDownload.src = currentImageUrl!;
-}, [currentImage, currentImageUrl, layers]);
+    imageToDownload.src = currentImageUrl;
+  }, [currentImageUrl, layers]);
   
   const handleFileSelect = (files: FileList | null) => {
     if (files && files[0]) {
@@ -486,7 +510,6 @@ const App: React.FC = () => {
     dragInfo.current.id = id;
     const el = e.currentTarget;
     const rect = el.getBoundingClientRect();
-    const containerRect = imageContainerRef.current!.getBoundingClientRect();
     dragInfo.current.offset = {
       x: e.clientX - rect.left,
       y: e.clientY - rect.top,
@@ -532,9 +555,15 @@ const App: React.FC = () => {
   };
 
   const handleMergeLayers = () => {
-    if (!currentImageUrl) return;
+    if (!currentImageUrl || !imgRef.current) return;
     setIsLoading(true);
+
+    const image = imgRef.current;
+    const scaleX = image.naturalWidth / image.width;
+    const scaleY = image.naturalHeight / image.height;
+
     const imageToMerge = new Image();
+    imageToMerge.crossOrigin = 'anonymous';
     imageToMerge.onload = () => {
         const canvas = document.createElement('canvas');
         canvas.width = imageToMerge.naturalWidth;
@@ -551,10 +580,12 @@ const App: React.FC = () => {
         [...layers].reverse().forEach(layer => {
             if (layer.visible && layer.type === 'text') {
                 ctx.globalAlpha = layer.opacity;
-                ctx.font = `${layer.size}px ${layer.font}`;
+                const avgScale = (scaleX + scaleY) / 2;
+                const scaledSize = layer.size * avgScale;
+                ctx.font = `${scaledSize}px ${layer.font}`;
                 ctx.fillStyle = layer.color;
                 ctx.textBaseline = 'top';
-                ctx.fillText(layer.content, layer.position.x, layer.position.y);
+                ctx.fillText(layer.content, layer.position.x * scaleX, layer.position.y * scaleY);
             }
         });
 
@@ -571,6 +602,51 @@ const App: React.FC = () => {
   };
 
   const selectedLayer = layers.find(l => l.id === selectedLayerId);
+
+  const handleAnalyzeImage = useCallback(async (userQuery: string) => {
+    if (!currentImage) {
+        setError('No image loaded to analyze.');
+        return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+    handleClearAnalysis();
+
+    try {
+        const result = await analyzeImage(currentImage, userQuery);
+        setAnalysisResult(result.feedback);
+        setAnalysisPromptForEdit(result.promptForEdit);
+    } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+        setError(`Failed to analyze the image. ${errorMessage}`);
+        console.error(err);
+    } finally {
+        setIsLoading(false);
+    }
+  }, [currentImage, handleClearAnalysis]);
+
+  const handleApplyAnalysis = useCallback(async () => {
+      if (!currentImage || !analysisPromptForEdit) {
+          setError('No analysis prompt available to apply.');
+          return;
+      }
+
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+          const editedImageUrl = await applyAnalysisPrompt(currentImage, analysisPromptForEdit);
+          const newImageFile = dataURLtoFile(editedImageUrl, `analyzed-edit-${Date.now()}.png`);
+          addImageToHistory(newImageFile);
+      } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+          setError(`Failed to apply the suggested edit. ${errorMessage}`);
+          console.error(err);
+      } finally {
+          setIsLoading(false);
+      }
+  }, [currentImage, analysisPromptForEdit, addImageToHistory]);
 
 
   const renderContent = () => {
@@ -715,7 +791,7 @@ const App: React.FC = () => {
         </div>
         
         <div className="w-full bg-gray-800/80 border border-gray-700/80 rounded-lg p-2 flex items-center justify-center gap-2 backdrop-blur-sm">
-            {(['retouch', 'crop', 'adjust', 'filters', 'text', 'layers'] as Tab[]).map(tab => {
+            {(['retouch', 'crop', 'adjust', 'filters', 'text', 'layers', 'analyze'] as Tab[]).map(tab => {
                 const icons: Record<Tab, React.FC<{className?: string}>> = {
                     retouch: MagicWandIcon,
                     crop: () => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5 mr-2"><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 3.75H6A2.25 2.25 0 0 0 3.75 6v1.5M16.5 3.75H18A2.25 2.25 0 0 1 20.25 6v1.5m0 9V18A2.25 2.25 0 0 1 18 20.25h-1.5m-9 0H6A2.25 2.25 0 0 1 3.75 18v-1.5M9 12l-3 3m0 0 3 3m-3-3h12" /></svg>,
@@ -723,6 +799,7 @@ const App: React.FC = () => {
                     filters: () => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5 mr-2"><path strokeLinecap="round" strokeLinejoin="round" d="m10.343 3.94.09-.542.56-1.007 1.11-1.11a12.001 12.001 0 0 1 5.052 0c.55.103 1.02.568 1.11 1.11a12.001 12.001 0 0 1 0 5.052c-.103.55-.568 1.02-1.11 1.11a12.001 12.001 0 0 1-5.052 0c-.55-.103-1.02-.568-1.11-1.11a12.001 12.001 0 0 1 0-5.052M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z" /></svg>,
                     text: TextIcon,
                     layers: LayersIcon,
+                    analyze: DocumentMagnifyingGlassIcon,
                 };
                 const Icon = icons[tab];
                  return (
@@ -792,6 +869,14 @@ const App: React.FC = () => {
                 onReorderLayers={handleReorderLayers}
                 onMergeLayers={handleMergeLayers}
                 isLoading={isLoading}
+            />}
+            {activeTab === 'analyze' && <AnalyzePanel 
+                onAnalyze={handleAnalyzeImage}
+                onApply={handleApplyAnalysis}
+                onClear={handleClearAnalysis}
+                isLoading={isLoading}
+                analysisResult={analysisResult}
+                canApply={!!analysisPromptForEdit}
             />}
 
         </div>
